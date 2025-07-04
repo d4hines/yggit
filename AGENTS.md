@@ -1,4 +1,4 @@
-# .clinerules
+# AGENTS.md
 
 ## Introduction
 Yggit is a specialized tool designed to support a "stacked commit" git workflow. It streamlines the process of creating layered commits, improving review efficiency and maintaining a clear commit history.
@@ -17,7 +17,7 @@ The repository is organized to facilitate clear separation of concerns:
   - **Git Integration:**  
     - `src/git/`: Contains modules for git operations including `git.rs` and `config.rs`.
   - **Parsing:**  
-    - `src/parser/`: Contains regex-based parsing rules and logic.
+    - `src/parser/`: Includes grammar definitions (e.g., `yggit.pest`) and parsing logic.
     
 - **Editor Integration (`editor/`)**
   - **Neovim Integration:**
@@ -26,7 +26,7 @@ The repository is organized to facilitate clear separation of concerns:
 
 - **Documentation**
   - `README.md`: Offers general information about the project.
-  - This file (.clinerules) provides information for LLM agents.
+  - This file (AGENTS.md) provides a detailed guide for future contributors.
 
 ## Development Workflow
 To work effectively with Yggit, follow these steps:
