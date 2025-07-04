@@ -7,7 +7,11 @@ use clap::Args;
 use std::collections::HashMap;
 
 #[derive(Debug, Args)]
-pub struct Push {}
+pub struct Push {
+    /// Skip GitHub PR creation and management
+    #[arg(long)]
+    pub no_pr: bool,
+}
 
 const COMMENTS: &str = r#"
 # Here is how to use yggit
@@ -60,8 +64,12 @@ impl Push {
 
         push_from_notes(&git);
 
-        // Step 3: Handle GitHub PR integration
-        handle_github_integration(&before_state, &after_state, &main_branch_name)?;
+        // Step 3: Handle GitHub PR integration (unless --no-pr flag is used)
+        if !self.no_pr {
+            handle_github_integration(&before_state, &after_state, &main_branch_name)?;
+        } else {
+            println!("⏭️  Skipping GitHub PR integration (--no-pr flag used)");
+        }
 
         Ok(())
     }
@@ -73,6 +81,7 @@ struct BranchState {
     branch: String,
     target_branch: String,
     origin: Option<String>,
+    commit_title: Option<String>,
 }
 
 /// Extract branch states from EnhancedCommits (with notes)
@@ -90,6 +99,7 @@ fn extract_branch_state(commits: &[EnhancedCommit<Note>]) -> HashMap<String, Bra
                     branch: push.branch.clone(),
                     target_branch,
                     origin: push.origin.clone(),
+                    commit_title: Some(commit.title.clone()),
                 };
                 
                 states.insert(push.branch.clone(), state);
@@ -114,6 +124,7 @@ fn extract_branch_state_from_parsed(commits: &[ParsedCommit]) -> HashMap<String,
                 branch: target.branch.clone(),
                 target_branch,
                 origin: target.origin.clone(),
+                commit_title: Some(commit.title.clone()),
             };
             
             states.insert(target.branch.clone(), state);
@@ -211,14 +222,18 @@ fn pr_exists(branch_name: &str) -> Result<bool, ()> {
 fn create_pull_request(branch_state: &BranchState, _main_branch_name: &str) -> Result<(), ()> {
     let target = &branch_state.target_branch;
     
-    println!("📝 Creating PR: {} → {}", branch_state.branch, target);
+    // Use commit title as PR title, fallback to branch name
+    let pr_title = branch_state.commit_title.as_ref()
+        .unwrap_or(&branch_state.branch);
+    
+    println!("📝 Creating PR: {} → {} (\"{}\")", branch_state.branch, target, pr_title);
     
     let mut cmd = std::process::Command::new("gh");
     cmd.args([
         "pr", "create",
         "--head", &branch_state.branch,
         "--base", target,
-        "--title", &format!("feat: {}", branch_state.branch),
+        "--title", pr_title,
         "--body", &format!("Auto-created PR for branch `{}` targeting `{}`\n\n🤖 Created by yggit", 
                           branch_state.branch, target),
     ]);
