@@ -70,6 +70,7 @@ impl Git {
     }
 
     /// List the commit in a repository and the attached note
+    /// Works with both linear and DAG commit structures
     pub fn list_commits<N>(&self) -> Vec<EnhancedCommit<N>>
     where
         N: DeserializeOwned,
@@ -99,6 +100,7 @@ impl Git {
         commits.reverse();
         commits
     }
+
 
     /// Returns the local id of the head of origin/{branch}
     pub fn find_local_remote_head(&self, origin: &str, branch: &str) -> Option<Oid> {
@@ -299,6 +301,69 @@ impl Git {
                 }
             }
         }
+    }
+
+    /// Create a new commit with the same content as the given commit but with proper parent relationships for DAG structure
+    pub fn create_commit_with_parent(&self, original_oid: Oid, parent_branch: Option<&str>) -> Result<Oid, ()> {
+        
+        // Get the original commit to copy its content
+        let original_commit = self.repository.find_commit(original_oid).map_err(|_| ())?;
+        
+        // Determine the parent commit
+        let parent_commits: Vec<_> = if let Some(parent_branch_name) = parent_branch {
+            // Use the head of the specified parent branch
+            if let Some(parent_oid) = self.head_of(parent_branch_name) {
+                vec![self.repository.find_commit(parent_oid).map_err(|_| ())?]
+            } else {
+                // Parent branch doesn't exist, use main branch as fallback
+                let main_branch = self.main_branch().ok_or(())?;
+                let main_commit = main_branch.get().peel_to_commit().map_err(|_| ())?;
+                vec![main_commit]
+            }
+        } else {
+            // No parent specified, use main branch as default
+            let main_branch = self.main_branch().ok_or(())?;
+            let main_commit = main_branch.get().peel_to_commit().map_err(|_| ())?;
+            vec![main_commit]
+        };
+        
+        // Create signatures (reuse from original commit)
+        let author = original_commit.author();
+        let committer = original_commit.committer();
+        
+        // Get the tree from the original commit
+        let tree = original_commit.tree().map_err(|_| ())?;
+        
+        // Create new commit with proper parent relationships
+        let parent_refs: Vec<&_> = parent_commits.iter().collect();
+        let new_commit_oid = self.repository.commit(
+            None, // Don't update any reference yet
+            &author,
+            &committer,
+            original_commit.message().unwrap_or(""),
+            &tree,
+            &parent_refs,
+        ).map_err(|_| ())?;
+        
+        Ok(new_commit_oid)
+    }
+
+    /// Set the head of the given branch to the given commit, ensuring it branches from the specified parent
+    pub fn set_branch_to_commit_with_parent(&self, branch: &str, oid: Oid, parent_branch: Option<&str>) -> Result<(), ()> {
+        // If we have a parent branch specified, create a new commit with proper parent relationships
+        let target_commit_oid = if parent_branch.is_some() {
+            // Create a new commit with the correct parent
+            self.create_commit_with_parent(oid, parent_branch)?
+        } else {
+            // No parent specified, use the original commit
+            oid
+        };
+        
+        if let Some(parent) = parent_branch {
+            println!("Created DAG commit for branch '{}' from parent '{}': {}", branch, parent, target_commit_oid);
+        }
+        
+        self.set_branch_to_commit(branch, target_commit_oid)
     }
 
     /// Open the given file with the user's editor and returns the content of this file
