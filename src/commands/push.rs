@@ -82,6 +82,7 @@ struct BranchState {
     target_branch: String,
     origin: Option<String>,
     commit_title: Option<String>,
+    commit_description: Option<String>,
 }
 
 /// Extract branch states from EnhancedCommits (with notes)
@@ -100,6 +101,7 @@ fn extract_branch_state(commits: &[EnhancedCommit<Note>]) -> HashMap<String, Bra
                     target_branch,
                     origin: push.origin.clone(),
                     commit_title: Some(commit.title.clone()),
+                    commit_description: commit.description.clone(),
                 };
                 
                 states.insert(push.branch.clone(), state);
@@ -125,6 +127,7 @@ fn extract_branch_state_from_parsed(commits: &[ParsedCommit]) -> HashMap<String,
                 target_branch,
                 origin: target.origin.clone(),
                 commit_title: Some(commit.title.clone()),
+                commit_description: None, // ParsedCommit doesn't have description
             };
             
             states.insert(target.branch.clone(), state);
@@ -154,7 +157,9 @@ fn handle_github_integration(
         if !before_state.contains_key(branch_name) {
             // New branch - create PR
             println!("🆕 New branch detected: {}", branch_name);
-            create_pull_request(after_branch, main_branch_name)?;
+            // For new branches, we need to find the matching commit in before_state to get description
+            let branch_with_description = find_branch_with_description(after_branch, before_state);
+            create_pull_request(&branch_with_description, main_branch_name)?;
         } else {
             // Existing branch - check if target changed
             let before_branch = &before_state[branch_name];
@@ -166,7 +171,8 @@ fn handle_github_integration(
                 // Check if PR exists, create if missing
                 if !pr_exists(branch_name)? {
                     println!("📝 No PR found for existing branch: {}", branch_name);
-                    create_pull_request(after_branch, main_branch_name)?;
+                    // Use before_branch for existing branches to get commit description
+                    create_pull_request(before_branch, main_branch_name)?;
                 }
             }
         }
@@ -189,6 +195,62 @@ fn is_gh_available() -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+/// Find a branch with description by matching commit title
+fn find_branch_with_description(after_branch: &BranchState, before_state: &HashMap<String, BranchState>) -> BranchState {
+    // Look for a branch in before_state with the same commit title
+    for (_, before_branch) in before_state {
+        if before_branch.commit_title == after_branch.commit_title {
+            // Found a match, create a new BranchState with the description but other fields from after_branch
+            return BranchState {
+                branch: after_branch.branch.clone(),
+                target_branch: after_branch.target_branch.clone(),
+                origin: after_branch.origin.clone(),
+                commit_title: after_branch.commit_title.clone(),
+                commit_description: before_branch.commit_description.clone(),
+            };
+        }
+    }
+    
+    // No match found, return the original after_branch
+    after_branch.clone()
+}
+
+/// Check if a branch exists locally or remotely
+fn branch_exists(branch_name: &str) -> Result<bool, ()> {
+    // First check if branch exists locally
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["branch", "--list", branch_name]);
+    
+    match cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if !stdout.trim().is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    
+    // If not found locally, check if it exists on remote
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(["ls-remote", "--heads", "origin", branch_name]);
+    
+    match cmd.output() {
+        Ok(output) => {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                Ok(!stdout.trim().is_empty())
+            } else {
+                // If we can't check remote, assume it doesn't exist
+                Ok(false)
+            }
+        }
+        Err(_) => Ok(false)
+    }
 }
 
 /// Check if a PR exists for the given branch
@@ -227,6 +289,7 @@ fn create_pull_request(branch_state: &BranchState, _main_branch_name: &str) -> R
         .unwrap_or(&branch_state.branch);
     
     println!("📝 Creating PR: {} → {} (\"{}\")", branch_state.branch, target, pr_title);
+    println!("Debug: description {:?} ", branch_state.commit_description);
     
     let mut cmd = std::process::Command::new("gh");
     cmd.args([
@@ -234,8 +297,9 @@ fn create_pull_request(branch_state: &BranchState, _main_branch_name: &str) -> R
         "--head", &branch_state.branch,
         "--base", target,
         "--title", pr_title,
-        "--body", &format!("Auto-created PR for branch `{}` targeting `{}`\n\n🤖 Created by yggit", 
-                          branch_state.branch, target),
+        "--body", &format!("{}\n\n🤖 Created by yggit", 
+                          branch_state.commit_description.as_ref()
+                              .unwrap_or(&String::new())),
     ]);
 
     match cmd.output() {
