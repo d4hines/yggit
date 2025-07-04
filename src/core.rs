@@ -1,4 +1,5 @@
 use crate::{
+    errors::Result,
     git::{EnhancedCommit, Git},
     parser::Target,
 };
@@ -7,12 +8,12 @@ use git2::Oid;
 
 /// Trait for Git operations that can be mocked for testing
 pub trait GitOperations {
-    fn set_branch_to_commit_with_parent(&self, branch: &str, oid: Oid, parent_branch: Option<&str>) -> Result<(), ()>;
+    fn set_branch_to_commit_with_parent(&self, branch: &str, oid: Oid, parent_branch: Option<&str>) -> Result<()>;
     fn head_of(&self, branch: &str) -> Option<Oid>;
 }
 
 impl GitOperations for Git {
-    fn set_branch_to_commit_with_parent(&self, branch: &str, oid: Oid, parent_branch: Option<&str>) -> Result<(), ()> {
+    fn set_branch_to_commit_with_parent(&self, branch: &str, oid: Oid, parent_branch: Option<&str>) -> Result<()> {
         Git::set_branch_to_commit_with_parent(self, branch, oid, parent_branch)
     }
     
@@ -114,8 +115,8 @@ pub fn push_from_notes(git: &Git) {
                     println!("✅ Created branch '{}'", branch);
                 }
             }
-            Err(()) => {
-                eprintln!("❌ Failed to create branch '{}'", branch);
+            Err(e) => {
+                eprintln!("❌ Failed to create branch '{}': {}", branch, e);
                 if let Some(parent) = parent_branch {
                     eprintln!("   Parent branch '{}' may not exist", parent);
                 }
@@ -192,7 +193,7 @@ mod tests {
     }
 
     impl GitOperations for MockGit {
-        fn set_branch_to_commit_with_parent(&self, branch: &str, oid: Oid, parent_branch: Option<&str>) -> Result<(), ()> {
+        fn set_branch_to_commit_with_parent(&self, branch: &str, oid: Oid, parent_branch: Option<&str>) -> Result<()> {
             let operation = match parent_branch {
                 Some(parent) => format!("create {} -> {} (from {})", branch, oid, parent),
                 None => format!("create {} -> {}", branch, oid),
