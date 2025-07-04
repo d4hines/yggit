@@ -6,7 +6,9 @@ use git::Git;
 
 mod commands;
 mod core;
+mod errors;
 mod git;
+mod github;
 mod parser;
 
 #[derive(Debug, Parser)] // requires `derive` feature
@@ -24,12 +26,19 @@ enum Commands {
 }
 
 fn main() {
+    env_logger::init();
+    
     let args = Cli::parse();
 
     let git = Git::open(".");
 
-    let _ = match args.command {
+    let result = match args.command {
         Commands::Push(push) => push.execute(git),
         Commands::Show(show) => show.execute(git),
     };
+    
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
 }

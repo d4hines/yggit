@@ -1,4 +1,5 @@
 use super::config::GitConfig;
+use crate::errors::{Result, YggitError};
 use auth_git2::GitAuthenticator;
 use git2::{Branch, BranchType, Oid, Repository, Signature};
 use serde::{de::DeserializeOwned, Serialize};
@@ -229,18 +230,16 @@ impl Git {
     /// Set the note of a given oid
     ///
     /// The note will be serialize to json format
-    pub fn set_note<N>(&self, oid: Oid, note: N) -> Result<(), ()>
+    pub fn set_note<N>(&self, oid: Oid, note: N) -> Result<()>
     where
         N: Serialize,
     {
-        let Ok(note) = serde_json::to_string(&note) else {
-            return Err(());
-        };
+        let note = serde_json::to_string(&note)?;
 
         self.repository
             .note(&self.signature, &self.signature, None, oid, &note, true)
             .map(|_| ())
-            .map_err(|_| ())
+            .map_err(|e| YggitError::Git(format!("Failed to set note: {}", e)))
     }
 
     /// Retrieve a commit with its node
@@ -290,11 +289,9 @@ impl Git {
     }
 
     /// Set the head of the given branch to the given commit
-    pub fn set_branch_to_commit(&self, branch: &str, oid: Oid) -> Result<(), ()> {
-        let Ok(commit) = self.repository.find_commit(oid) else {
-            println!("commit does not exist");
-            return Err(());
-        };
+    pub fn set_branch_to_commit(&self, branch: &str, oid: Oid) -> Result<()> {
+        let commit = self.repository.find_commit(oid)
+            .map_err(|e| YggitError::Git(format!("Commit {} does not exist: {}", oid, e)))?;
 
         let res = self.repository.branch(branch, &commit, true);
         match res {
@@ -305,33 +302,39 @@ impl Git {
                 if is_ok {
                     Ok(()) // Not the best but it works
                 } else {
-                    Err(())
+                    Err(YggitError::Git(format!("Failed to create branch {}: {}", branch, code)))
                 }
             }
         }
     }
 
     /// Create a new commit with the same content as the given commit but with proper parent relationships for DAG structure
-    pub fn create_commit_with_parent(&self, original_oid: Oid, parent_branch: Option<&str>) -> Result<Oid, ()> {
+    pub fn create_commit_with_parent(&self, original_oid: Oid, parent_branch: Option<&str>) -> Result<Oid> {
         
         // Get the original commit to copy its content
-        let original_commit = self.repository.find_commit(original_oid).map_err(|_| ())?;
+        let original_commit = self.repository.find_commit(original_oid)
+            .map_err(|e| YggitError::Git(format!("Failed to find commit {}: {}", original_oid, e)))?;
         
         // Determine the parent commit
         let parent_commits: Vec<_> = if let Some(parent_branch_name) = parent_branch {
             // Use the head of the specified parent branch
             if let Some(parent_oid) = self.head_of(parent_branch_name) {
-                vec![self.repository.find_commit(parent_oid).map_err(|_| ())?]
+                vec![self.repository.find_commit(parent_oid)
+                    .map_err(|e| YggitError::Git(format!("Failed to find parent commit {}: {}", parent_oid, e)))?]
             } else {
                 // Parent branch doesn't exist, use main branch as fallback
-                let main_branch = self.main_branch().ok_or(())?;
-                let main_commit = main_branch.get().peel_to_commit().map_err(|_| ())?;
+                let main_branch = self.main_branch()
+                    .ok_or_else(|| YggitError::BranchNotFound("main/master".to_string()))?;
+                let main_commit = main_branch.get().peel_to_commit()
+                    .map_err(|e| YggitError::Git(format!("Failed to get main branch commit: {}", e)))?;
                 vec![main_commit]
             }
         } else {
             // No parent specified, use main branch as default
-            let main_branch = self.main_branch().ok_or(())?;
-            let main_commit = main_branch.get().peel_to_commit().map_err(|_| ())?;
+            let main_branch = self.main_branch()
+                .ok_or_else(|| YggitError::BranchNotFound("main/master".to_string()))?;
+            let main_commit = main_branch.get().peel_to_commit()
+                .map_err(|e| YggitError::Git(format!("Failed to get main branch commit: {}", e)))?;
             vec![main_commit]
         };
         
@@ -340,7 +343,8 @@ impl Git {
         let committer = original_commit.committer();
         
         // Get the tree from the original commit
-        let tree = original_commit.tree().map_err(|_| ())?;
+        let tree = original_commit.tree()
+            .map_err(|e| YggitError::Git(format!("Failed to get commit tree: {}", e)))?;
         
         // Create new commit with proper parent relationships
         let parent_refs: Vec<&_> = parent_commits.iter().collect();
@@ -351,13 +355,13 @@ impl Git {
             original_commit.message().unwrap_or(""),
             &tree,
             &parent_refs,
-        ).map_err(|_| ())?;
+        ).map_err(|e| YggitError::Git(format!("Failed to create commit: {}", e)))?;
         
         Ok(new_commit_oid)
     }
 
     /// Set the head of the given branch to the given commit, ensuring it branches from the specified parent
-    pub fn set_branch_to_commit_with_parent(&self, branch: &str, oid: Oid, parent_branch: Option<&str>) -> Result<(), ()> {
+    pub fn set_branch_to_commit_with_parent(&self, branch: &str, oid: Oid, parent_branch: Option<&str>) -> Result<()> {
         // If we have a parent branch specified, create a new commit with proper parent relationships
         let target_commit_oid = if parent_branch.is_some() {
             // Create a new commit with the correct parent
@@ -375,15 +379,18 @@ impl Git {
     }
 
     /// Open the given file with the user's editor and returns the content of this file
-    pub fn edit_file(&self, file_path: &str) -> Result<String, ()> {
+    pub fn edit_file(&self, file_path: &str) -> Result<String> {
         let output = Command::new(&self.config.core.editor)
             .arg(file_path)
             .status()
-            .expect("Failed to execute command");
-        let true = output.success() else {
-            return Err(());
-        };
-        let content = std::fs::read_to_string(file_path).unwrap();
+            .map_err(|e| YggitError::Io(e))?;
+        
+        if !output.success() {
+            return Err(YggitError::File(format!("Editor command failed with status: {}", output)));
+        }
+        
+        let content = std::fs::read_to_string(file_path)
+            .map_err(|e| YggitError::File(format!("Failed to read file {}: {}", file_path, e)))?;
         Ok(content)
     }
 }

@@ -1,10 +1,11 @@
 use crate::{
-    core::{push_from_notes, save_note, Note},
-    git::{Git, EnhancedCommit},
-    parser::{commits_to_string, Commit as ParsedCommit},
+    core::{push_from_notes, save_note},
+    errors::Result,
+    git::Git,
+    github::{GitHubCliImpl, GitHubIntegration, extract_branch_state, extract_branch_state_from_parsed},
+    parser::commits_to_string,
 };
 use clap::Args;
-use std::collections::HashMap;
 
 #[derive(Debug, Args)]
 pub struct Push {
@@ -34,7 +35,7 @@ const COMMENTS: &str = r#"
 "#;
 
 impl Push {
-    pub fn execute(&self, git: Git) -> Result<(), ()> {
+    pub fn execute(&self, git: Git) -> Result<()> {
         // Step 1: Capture the current state (before editing)
         let before_commits = git.list_commits();
         let before_state = extract_branch_state(&before_commits);
@@ -44,7 +45,10 @@ impl Push {
         let file_path = "/tmp/yggit";
 
         let output = format!("{}\n{}", output, COMMENTS);
-        std::fs::write(file_path, output).map_err(|_| println!("cannot write file to disk"))?;
+        std::fs::write(file_path, output).map_err(|e| {
+            log::error!("Cannot write file to disk: {}", e);
+            e
+        })?;
 
         let content = git.edit_file(file_path)?;
 
@@ -53,9 +57,11 @@ impl Push {
             .and_then(|branch| branch.name().ok().flatten().map(|s| s.to_string()))
             .unwrap_or_else(|| "main".to_string());
             
-        let after_commits = crate::parser::instruction_from_string_with_main_branch(content, main_branch_name.clone()).ok_or_else(|| {
-            println!("Cannot parse instructions");
-        })?;
+        let after_commits = crate::parser::instruction_from_string_with_main_branch(content, main_branch_name.clone())
+            .ok_or_else(|| {
+                log::error!("Cannot parse instructions");
+                crate::errors::YggitError::Parse("Failed to parse instructions".to_string())
+            })?;
 
         // Step 2: Extract the new state (after editing)
         let after_state = extract_branch_state_from_parsed(&after_commits);
@@ -66,301 +72,14 @@ impl Push {
 
         // Step 3: Handle GitHub PR integration (unless --no-pr flag is used)
         if !self.no_pr {
-            handle_github_integration(&before_state, &after_state, &main_branch_name)?;
+            let github_cli = GitHubCliImpl::new();
+            let github_integration = GitHubIntegration::new(github_cli);
+            github_integration.handle_integration(&before_state, &after_state, &main_branch_name)?;
         } else {
-            println!("⏭️  Skipping GitHub PR integration (--no-pr flag used)");
+            log::info!("⏭️  Skipping GitHub PR integration (--no-pr flag used)");
         }
 
         Ok(())
     }
 }
 
-/// Represents the state of a branch for PR management
-#[derive(Debug, Clone, PartialEq)]
-struct BranchState {
-    branch: String,
-    target_branch: String,
-    origin: Option<String>,
-    commit_title: Option<String>,
-    commit_description: Option<String>,
-}
-
-/// Extract branch states from EnhancedCommits (with notes)
-fn extract_branch_state(commits: &[EnhancedCommit<Note>]) -> HashMap<String, BranchState> {
-    let mut states = HashMap::new();
-    
-    for commit in commits {
-        if let Some(note) = &commit.note {
-            if let Some(push) = &note.push {
-                let target_branch = push.parent_branch.as_ref()
-                    .unwrap_or(&"main".to_string())
-                    .clone();
-                
-                let state = BranchState {
-                    branch: push.branch.clone(),
-                    target_branch,
-                    origin: push.origin.clone(),
-                    commit_title: Some(commit.title.clone()),
-                    commit_description: commit.description.clone(),
-                };
-                
-                states.insert(push.branch.clone(), state);
-            }
-        }
-    }
-    
-    states
-}
-
-/// Extract branch states from parsed commits (before notes are saved)
-fn extract_branch_state_from_parsed(commits: &[ParsedCommit]) -> HashMap<String, BranchState> {
-    let mut states = HashMap::new();
-    
-    for commit in commits {
-        if let Some(target) = &commit.target {
-            let target_branch = target.parent_branch.as_ref()
-                .unwrap_or(&"main".to_string())
-                .clone();
-            
-            let state = BranchState {
-                branch: target.branch.clone(),
-                target_branch,
-                origin: target.origin.clone(),
-                commit_title: Some(commit.title.clone()),
-                commit_description: None, // ParsedCommit doesn't have description
-            };
-            
-            states.insert(target.branch.clone(), state);
-        }
-    }
-    
-    states
-}
-
-/// Handle GitHub PR integration by comparing before/after states
-fn handle_github_integration(
-    before_state: &HashMap<String, BranchState>,
-    after_state: &HashMap<String, BranchState>,
-    main_branch_name: &str,
-) -> Result<(), ()> {
-    // Check if gh CLI is available
-    if !is_gh_available() {
-        println!("📝 GitHub CLI (gh) not found. Skipping PR integration.");
-        println!("   Install gh CLI for automatic PR management: https://cli.github.com/");
-        return Ok(());
-    }
-
-    println!("🔗 Managing GitHub Pull Requests...");
-
-    // Handle new branches and target changes
-    for (branch_name, after_branch) in after_state {
-        if !before_state.contains_key(branch_name) {
-            // New branch - create PR
-            println!("🆕 New branch detected: {}", branch_name);
-            // For new branches, we need to find the matching commit in before_state to get description
-            let branch_with_description = find_branch_with_description(after_branch, before_state);
-            create_pull_request(&branch_with_description, main_branch_name)?;
-        } else {
-            // Existing branch - check if target changed
-            let before_branch = &before_state[branch_name];
-            if before_branch.target_branch != after_branch.target_branch {
-                // Target changed - update PR
-                println!("🔄 Target changed for {}: {} -> {}", branch_name, before_branch.target_branch, after_branch.target_branch);
-                update_pull_request_base(after_branch, &before_branch.target_branch)?;
-            } else {
-                // Check if PR exists, create if missing
-                if !pr_exists(branch_name)? {
-                    println!("📝 No PR found for existing branch: {}", branch_name);
-                    // Use before_branch for existing branches to get commit description
-                    create_pull_request(before_branch, main_branch_name)?;
-                }
-            }
-        }
-    }
-
-    // Find removed branches (in before but not in after)
-    for (branch_name, _before_branch) in before_state {
-        if !after_state.contains_key(branch_name) {
-            println!("ℹ️  Branch '{}' removed. PR will remain open.", branch_name);
-        }
-    }
-
-    Ok(())
-}
-
-/// Check if gh CLI is available
-fn is_gh_available() -> bool {
-    std::process::Command::new("gh")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
-}
-
-/// Find a branch with description by matching commit title
-fn find_branch_with_description(after_branch: &BranchState, before_state: &HashMap<String, BranchState>) -> BranchState {
-    // Look for a branch in before_state with the same commit title
-    for (_, before_branch) in before_state {
-        if before_branch.commit_title == after_branch.commit_title {
-            // Found a match, create a new BranchState with the description but other fields from after_branch
-            return BranchState {
-                branch: after_branch.branch.clone(),
-                target_branch: after_branch.target_branch.clone(),
-                origin: after_branch.origin.clone(),
-                commit_title: after_branch.commit_title.clone(),
-                commit_description: before_branch.commit_description.clone(),
-            };
-        }
-    }
-    
-    // No match found, return the original after_branch
-    after_branch.clone()
-}
-
-/// Check if a branch exists locally or remotely
-fn branch_exists(branch_name: &str) -> Result<bool, ()> {
-    // First check if branch exists locally
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(["branch", "--list", branch_name]);
-    
-    match cmd.output() {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.trim().is_empty() {
-                    return Ok(true);
-                }
-            }
-        }
-        Err(_) => {}
-    }
-    
-    // If not found locally, check if it exists on remote
-    let mut cmd = std::process::Command::new("git");
-    cmd.args(["ls-remote", "--heads", "origin", branch_name]);
-    
-    match cmd.output() {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                Ok(!stdout.trim().is_empty())
-            } else {
-                // If we can't check remote, assume it doesn't exist
-                Ok(false)
-            }
-        }
-        Err(_) => Ok(false)
-    }
-}
-
-/// Check if a PR exists for the given branch
-fn pr_exists(branch_name: &str) -> Result<bool, ()> {
-    let mut cmd = std::process::Command::new("gh");
-    cmd.args(["pr", "list", "--head", branch_name, "--json", "number"]);
-    
-    match cmd.output() {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                // If the JSON output is "[]", no PRs exist for this branch
-                let exists = !stdout.trim().eq("[]");
-                println!("🔍 Debug - PR exists for {}: {}", branch_name, exists);
-                Ok(exists)
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                println!("⚠️  Warning: Could not check PR status for {}: {}", branch_name, stderr);
-                // If we can't check, assume it doesn't exist and try to create it
-                Ok(false)
-            }
-        }
-        Err(e) => {
-            println!("❌ Error checking PR status: {}", e);
-            Err(())
-        }
-    }
-}
-
-/// Create a new pull request using gh CLI
-fn create_pull_request(branch_state: &BranchState, _main_branch_name: &str) -> Result<(), ()> {
-    let target = &branch_state.target_branch;
-    
-    // Use commit title as PR title, fallback to branch name
-    let pr_title = branch_state.commit_title.as_ref()
-        .unwrap_or(&branch_state.branch);
-    
-    println!("📝 Creating PR: {} → {} (\"{}\")", branch_state.branch, target, pr_title);
-    println!("Debug: description {:?} ", branch_state.commit_description);
-    
-    let mut cmd = std::process::Command::new("gh");
-    cmd.args([
-        "pr", "create",
-        "--head", &branch_state.branch,
-        "--base", target,
-        "--title", pr_title,
-        "--body", &format!("{}\n\n🤖 Created by yggit", 
-                          branch_state.commit_description.as_ref()
-                              .unwrap_or(&String::new())),
-    ]);
-
-    match cmd.output() {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if !stdout.trim().is_empty() {
-                    println!("✅ Created PR: {}", stdout.trim());
-                } else {
-                    println!("✅ Created PR for {}", branch_state.branch);
-                }
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                if stderr.contains("already exists") {
-                    println!("ℹ️  PR for {} already exists", branch_state.branch);
-                } else {
-                    println!("❌ Failed to create PR for {}: {}", branch_state.branch, stderr);
-                }
-            }
-        }
-        Err(e) => {
-            println!("❌ Error running gh CLI: {}", e);
-            return Err(());
-        }
-    }
-    
-    Ok(())
-}
-
-/// Update the base branch of an existing pull request
-fn update_pull_request_base(branch_state: &BranchState, old_target: &str) -> Result<(), ()> {
-    let new_target = &branch_state.target_branch;
-    
-    println!("🔄 Updating PR base: {} ({} → {})", branch_state.branch, old_target, new_target);
-    
-    let mut cmd = std::process::Command::new("gh");
-    cmd.args([
-        "pr", "edit",
-        &branch_state.branch,
-        "--base", new_target,
-    ]);
-
-    match cmd.output() {
-        Ok(output) => {
-            if output.status.success() {
-                println!("✅ Updated PR base for {}", branch_state.branch);
-            } else {
-                let error = String::from_utf8_lossy(&output.stderr);
-                if error.contains("not found") {
-                    println!("ℹ️  No existing PR found for {}. Creating new PR...", branch_state.branch);
-                    create_pull_request(branch_state, new_target)?;
-                } else {
-                    println!("❌ Failed to update PR for {}: {}", branch_state.branch, error);
-                }
-            }
-        }
-        Err(e) => {
-            println!("❌ Error running gh CLI: {}", e);
-            return Err(());
-        }
-    }
-    
-    Ok(())
-}
