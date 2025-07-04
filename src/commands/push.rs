@@ -82,6 +82,7 @@ struct BranchState {
     target_branch: String,
     origin: Option<String>,
     commit_title: Option<String>,
+    commit_description: Option<String>,
 }
 
 /// Extract branch states from EnhancedCommits (with notes)
@@ -100,6 +101,7 @@ fn extract_branch_state(commits: &[EnhancedCommit<Note>]) -> HashMap<String, Bra
                     target_branch,
                     origin: push.origin.clone(),
                     commit_title: Some(commit.title.clone()),
+                    commit_description: commit.description.clone(),
                 };
                 
                 states.insert(push.branch.clone(), state);
@@ -125,6 +127,7 @@ fn extract_branch_state_from_parsed(commits: &[ParsedCommit]) -> HashMap<String,
                 target_branch,
                 origin: target.origin.clone(),
                 commit_title: Some(commit.title.clone()),
+                commit_description: None, // ParsedCommit doesn't have description
             };
             
             states.insert(target.branch.clone(), state);
@@ -234,8 +237,9 @@ fn create_pull_request(branch_state: &BranchState, _main_branch_name: &str) -> R
         "--head", &branch_state.branch,
         "--base", target,
         "--title", pr_title,
-        "--body", &format!("Auto-created PR for branch `{}` targeting `{}`\n\n🤖 Created by yggit", 
-                          branch_state.branch, target),
+        "--body", &format!("{}\n\n🤖 Created by yggit", 
+                          branch_state.commit_description.as_ref()
+                              .unwrap_or(&String::new())),
     ]);
 
     match cmd.output() {
