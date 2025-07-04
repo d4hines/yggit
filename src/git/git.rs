@@ -271,7 +271,15 @@ impl Git {
         // Title is on the first line of the message
         let title = message.next().unwrap_or_default().to_string();
         // Remaining lines are for the description
-        let description = message.next().map(str::to_string);
+        let description = message.next()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        
+        // Debug logging
+        println!("DEBUG: Parsing commit {}", oid);
+        println!("DEBUG: Full message: {:?}", commit.message().unwrap_or_default());
+        println!("DEBUG: Title: {:?}", title);
+        println!("DEBUG: Description: {:?}", description);
 
         Some(EnhancedCommit {
             id: oid,
