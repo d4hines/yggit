@@ -63,10 +63,15 @@ pub fn instruction_from_string(input: String) -> Option<Vec<Commit>> {
     instruction_from_string_with_main_branch(input, "main".to_string())
 }
 
-pub fn instruction_from_string_with_main_branch(input: String, main_branch_name: String) -> Option<Vec<Commit>> {
+pub fn instruction_from_string_with_main_branch(
+    input: String,
+    main_branch_name: String,
+) -> Option<Vec<Commit>> {
     let commit_header_re = Regex::new(r"^(?P<hash>[0-9a-fA-F]{40})\s+(?P<title>.+)$").ok()?;
-    let target_re = Regex::new(r"^->\s*(?:(?P<origin>[^:]+):)?(?P<branch>[^=]+?)(?:\s*=>\s*(?P<parent>.+))?$").ok()?;
-    
+    let target_re =
+        Regex::new(r"^->\s*(?:(?P<origin>[^:]+):)?(?P<branch>[^=]+?)(?:\s*=>\s*(?P<parent>.+))?$")
+            .ok()?;
+
     let mut commits = Vec::new();
     let lines: Vec<&str> = input.lines().map(|line| line.trim()).collect();
     let mut i = 0;
@@ -87,23 +92,36 @@ pub fn instruction_from_string_with_main_branch(input: String, main_branch_name:
                         if next_line.starts_with("->") {
                             if let Some(target_caps) = target_re.captures(next_line) {
                                 if let Some(branch_cap) = target_caps.name("branch") {
-                                    let origin = target_caps.name("origin").map(|m| m.as_str().to_string());
+                                    let origin =
+                                        target_caps.name("origin").map(|m| m.as_str().to_string());
                                     let branch = branch_cap.as_str().trim().to_string();
-                                    let mut parent_branch = target_caps.name("parent").map(|m| m.as_str().trim().to_string());
-                                    
+                                    let mut parent_branch = target_caps
+                                        .name("parent")
+                                        .map(|m| m.as_str().trim().to_string());
+
                                     // If no explicit parent specified, use the last branch or main branch if first
                                     if parent_branch.is_none() {
-                                        parent_branch = last_branch.clone().or_else(|| Some(main_branch_name.clone()));
+                                        parent_branch = last_branch
+                                            .clone()
+                                            .or_else(|| Some(main_branch_name.clone()));
                                     }
-                                    
-                                    target = Some(Target { origin, branch: branch.clone(), parent_branch });
+
+                                    target = Some(Target {
+                                        origin,
+                                        branch: branch.clone(),
+                                        parent_branch,
+                                    });
                                     last_branch = Some(branch);
                                     i += 1;
                                 }
                             }
                         }
                     }
-                    commits.push(Commit { hash, title, target });
+                    commits.push(Commit {
+                        hash,
+                        title,
+                        target,
+                    });
                 }
             }
         }
@@ -201,21 +219,21 @@ mod tests {
         let input = "8c14734b80ff0ffb93caefc85553c7c5b05cca1e First commit\n-> feature-1\n\n9d25845c91ff1aac84dbffd96664d8d6c16dccb2 Second commit\n-> feature-2 => feature-1\n\nae36956d02aa2bce95ecbba07775e9e7d27edde3 Third commit\n-> feature-3 => main\n";
         let commits = instruction_from_string(input.to_string()).expect("Should parse commits");
         assert_eq!(commits.len(), 3);
-        
+
         // First commit (linear from main)
         let commit1 = &commits[0];
         assert_eq!(commit1.title, "First commit".to_string());
         let target1 = commit1.target.as_ref().unwrap();
         assert_eq!(target1.branch, "feature-1".to_string());
         assert_eq!(target1.parent_branch, Some("main".to_string()));
-        
+
         // Second commit (branches from feature-1)
         let commit2 = &commits[1];
         assert_eq!(commit2.title, "Second commit".to_string());
         let target2 = commit2.target.as_ref().unwrap();
         assert_eq!(target2.branch, "feature-2".to_string());
         assert_eq!(target2.parent_branch, Some("feature-1".to_string()));
-        
+
         // Third commit (branches from main, creating DAG)
         let commit3 = &commits[2];
         assert_eq!(commit3.title, "Third commit".to_string());
@@ -237,7 +255,7 @@ mod tests {
         assert_eq!(target1.branch, "foo".to_string());
         assert_eq!(target1.parent_branch, Some("bar".to_string()));
 
-        // Second commit: baz => bar (explicit parent)  
+        // Second commit: baz => bar (explicit parent)
         let target2 = commits[1].target.as_ref().unwrap();
         assert_eq!(target2.branch, "baz".to_string());
         assert_eq!(target2.parent_branch, Some("bar".to_string()));
@@ -274,7 +292,7 @@ mod tests {
     fn test_commits_to_string_shows_implicit_parents() {
         use crate::core::{Note, Push};
         use crate::git::EnhancedCommit;
-        
+
         // Create commits with implicit parent relationships
         let commits = vec![
             EnhancedCommit {
@@ -304,7 +322,7 @@ mod tests {
         ];
 
         let output = commits_to_string(commits);
-        
+
         // Verify that both explicit and implicit parents are shown
         assert!(output.contains("-> feature-1 => main\n")); // Default parent shown
         assert!(output.contains("-> feature-2 => feature-1\n")); // Implicit parent shown

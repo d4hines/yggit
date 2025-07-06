@@ -1,6 +1,6 @@
 use crate::{
     core::{push_from_notes, save_note, Note},
-    git::{Git, EnhancedCommit},
+    git::{EnhancedCommit, Git},
     parser::{commits_to_string, Commit as ParsedCommit},
 };
 use clap::Args;
@@ -38,7 +38,7 @@ impl Push {
         // Step 1: Capture the current state (before editing)
         let before_commits = git.list_commits();
         let before_state = extract_branch_state(&before_commits);
-        
+
         let output = commits_to_string(before_commits);
 
         let file_path = "/tmp/yggit";
@@ -49,11 +49,16 @@ impl Push {
         let content = git.edit_file(file_path)?;
 
         // Get the actual main branch name (main or master)
-        let main_branch_name = git.main_branch()
+        let main_branch_name = git
+            .main_branch()
             .and_then(|branch| branch.name().ok().flatten().map(|s| s.to_string()))
             .unwrap_or_else(|| "main".to_string());
-            
-        let after_commits = crate::parser::instruction_from_string_with_main_branch(content, main_branch_name.clone()).ok_or_else(|| {
+
+        let after_commits = crate::parser::instruction_from_string_with_main_branch(
+            content,
+            main_branch_name.clone(),
+        )
+        .ok_or_else(|| {
             println!("Cannot parse instructions");
         })?;
 
@@ -87,50 +92,54 @@ struct BranchState {
 /// Extract branch states from EnhancedCommits (with notes)
 fn extract_branch_state(commits: &[EnhancedCommit<Note>]) -> HashMap<String, BranchState> {
     let mut states = HashMap::new();
-    
+
     for commit in commits {
         if let Some(note) = &commit.note {
             if let Some(push) = &note.push {
-                let target_branch = push.parent_branch.as_ref()
+                let target_branch = push
+                    .parent_branch
+                    .as_ref()
                     .unwrap_or(&"main".to_string())
                     .clone();
-                
+
                 let state = BranchState {
                     branch: push.branch.clone(),
                     target_branch,
                     origin: push.origin.clone(),
                     commit_title: Some(commit.title.clone()),
                 };
-                
+
                 states.insert(push.branch.clone(), state);
             }
         }
     }
-    
+
     states
 }
 
 /// Extract branch states from parsed commits (before notes are saved)
 fn extract_branch_state_from_parsed(commits: &[ParsedCommit]) -> HashMap<String, BranchState> {
     let mut states = HashMap::new();
-    
+
     for commit in commits {
         if let Some(target) = &commit.target {
-            let target_branch = target.parent_branch.as_ref()
+            let target_branch = target
+                .parent_branch
+                .as_ref()
                 .unwrap_or(&"main".to_string())
                 .clone();
-            
+
             let state = BranchState {
                 branch: target.branch.clone(),
                 target_branch,
                 origin: target.origin.clone(),
                 commit_title: Some(commit.title.clone()),
             };
-            
+
             states.insert(target.branch.clone(), state);
         }
     }
-    
+
     states
 }
 
@@ -160,7 +169,10 @@ fn handle_github_integration(
             let before_branch = &before_state[branch_name];
             if before_branch.target_branch != after_branch.target_branch {
                 // Target changed - update PR
-                println!("🔄 Target changed for {}: {} -> {}", branch_name, before_branch.target_branch, after_branch.target_branch);
+                println!(
+                    "🔄 Target changed for {}: {} -> {}",
+                    branch_name, before_branch.target_branch, after_branch.target_branch
+                );
                 update_pull_request_base(after_branch, &before_branch.target_branch)?;
             } else {
                 // Check if PR exists, create if missing
@@ -195,7 +207,7 @@ fn is_gh_available() -> bool {
 fn pr_exists(branch_name: &str) -> Result<bool, ()> {
     let mut cmd = std::process::Command::new("gh");
     cmd.args(["pr", "list", "--head", branch_name, "--json", "number"]);
-    
+
     match cmd.output() {
         Ok(output) => {
             if output.status.success() {
@@ -206,7 +218,10 @@ fn pr_exists(branch_name: &str) -> Result<bool, ()> {
                 Ok(exists)
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                println!("⚠️  Warning: Could not check PR status for {}: {}", branch_name, stderr);
+                println!(
+                    "⚠️  Warning: Could not check PR status for {}: {}",
+                    branch_name, stderr
+                );
                 // If we can't check, assume it doesn't exist and try to create it
                 Ok(false)
             }
@@ -221,21 +236,33 @@ fn pr_exists(branch_name: &str) -> Result<bool, ()> {
 /// Create a new pull request using gh CLI
 fn create_pull_request(branch_state: &BranchState, _main_branch_name: &str) -> Result<(), ()> {
     let target = &branch_state.target_branch;
-    
+
     // Use commit title as PR title, fallback to branch name
-    let pr_title = branch_state.commit_title.as_ref()
+    let pr_title = branch_state
+        .commit_title
+        .as_ref()
         .unwrap_or(&branch_state.branch);
-    
-    println!("📝 Creating PR: {} → {} (\"{}\")", branch_state.branch, target, pr_title);
-    
+
+    println!(
+        "📝 Creating PR: {} → {} (\"{}\")",
+        branch_state.branch, target, pr_title
+    );
+
     let mut cmd = std::process::Command::new("gh");
     cmd.args([
-        "pr", "create",
-        "--head", &branch_state.branch,
-        "--base", target,
-        "--title", pr_title,
-        "--body", &format!("Auto-created PR for branch `{}` targeting `{}`\n\n🤖 Created by yggit", 
-                          branch_state.branch, target),
+        "pr",
+        "create",
+        "--head",
+        &branch_state.branch,
+        "--base",
+        target,
+        "--title",
+        pr_title,
+        "--body",
+        &format!(
+            "Auto-created PR for branch `{}` targeting `{}`\n\n🤖 Created by yggit",
+            branch_state.branch, target
+        ),
     ]);
 
     match cmd.output() {
@@ -252,7 +279,10 @@ fn create_pull_request(branch_state: &BranchState, _main_branch_name: &str) -> R
                 if stderr.contains("already exists") {
                     println!("ℹ️  PR for {} already exists", branch_state.branch);
                 } else {
-                    println!("❌ Failed to create PR for {}: {}", branch_state.branch, stderr);
+                    println!(
+                        "❌ Failed to create PR for {}: {}",
+                        branch_state.branch, stderr
+                    );
                 }
             }
         }
@@ -261,22 +291,21 @@ fn create_pull_request(branch_state: &BranchState, _main_branch_name: &str) -> R
             return Err(());
         }
     }
-    
+
     Ok(())
 }
 
 /// Update the base branch of an existing pull request
 fn update_pull_request_base(branch_state: &BranchState, old_target: &str) -> Result<(), ()> {
     let new_target = &branch_state.target_branch;
-    
-    println!("🔄 Updating PR base: {} ({} → {})", branch_state.branch, old_target, new_target);
-    
+
+    println!(
+        "🔄 Updating PR base: {} ({} → {})",
+        branch_state.branch, old_target, new_target
+    );
+
     let mut cmd = std::process::Command::new("gh");
-    cmd.args([
-        "pr", "edit",
-        &branch_state.branch,
-        "--base", new_target,
-    ]);
+    cmd.args(["pr", "edit", &branch_state.branch, "--base", new_target]);
 
     match cmd.output() {
         Ok(output) => {
@@ -285,10 +314,16 @@ fn update_pull_request_base(branch_state: &BranchState, old_target: &str) -> Res
             } else {
                 let error = String::from_utf8_lossy(&output.stderr);
                 if error.contains("not found") {
-                    println!("ℹ️  No existing PR found for {}. Creating new PR...", branch_state.branch);
+                    println!(
+                        "ℹ️  No existing PR found for {}. Creating new PR...",
+                        branch_state.branch
+                    );
                     create_pull_request(branch_state, new_target)?;
                 } else {
-                    println!("❌ Failed to update PR for {}: {}", branch_state.branch, error);
+                    println!(
+                        "❌ Failed to update PR for {}: {}",
+                        branch_state.branch, error
+                    );
                 }
             }
         }
@@ -297,6 +332,6 @@ fn update_pull_request_base(branch_state: &BranchState, old_target: &str) -> Res
             return Err(());
         }
     }
-    
+
     Ok(())
 }
