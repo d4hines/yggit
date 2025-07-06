@@ -59,6 +59,7 @@ pub struct Commit {
     pub target: Option<Target>,
 }
 
+#[cfg(test)]
 pub fn instruction_from_string(input: String) -> Option<Vec<Commit>> {
     instruction_from_string_with_main_branch(input, "main".to_string())
 }
