@@ -39,7 +39,7 @@ impl Push {
         let before_commits = git.list_commits();
         let before_state = extract_branch_state(&before_commits);
 
-        let output = commits_to_string(before_commits);
+        let output = commits_to_string(before_commits.clone());
 
         let file_path = "/tmp/yggit";
 
@@ -63,7 +63,27 @@ impl Push {
         })?;
 
         // Step 2: Extract the new state (after editing)
-        let after_state = extract_branch_state_from_parsed(&after_commits);
+        let after_state =
+            extract_branch_state_from_parsed(&after_commits)
+                .iter()
+                .map(|(key, x)| (key.clone(), BranchState {
+                    branch: x.branch.clone(),
+                    target_branch: x.target_branch.clone(),
+                    origin: x.origin.clone(),
+                    commit_title: x.commit_title.clone(),
+                    commit_description: {
+                        // Find the corresponding commit in after_commits to get its hash
+                        after_commits.iter()
+                            .find(|commit| commit.target.as_ref()
+                                .map(|t| &t.branch) == Some(&x.branch))
+                            .and_then(|after_commit| {
+                                // Find the same commit (by hash) in before_commits to get its description
+                                before_commits.iter()
+                                    .find(|before_commit| before_commit.id == after_commit.hash)
+                                    .and_then(|before_commit| before_commit.description.clone())
+                            })
+                    },
+                })).collect();
 
         save_note(&git, after_commits);
 
@@ -86,7 +106,8 @@ struct BranchState {
     branch: String,
     target_branch: String,
     origin: Option<String>,
-    commit_title: Option<String>,
+    commit_title: String,
+    commit_description: Option<String>,
 }
 
 /// Extract branch states from EnhancedCommits (with notes)
@@ -106,7 +127,8 @@ fn extract_branch_state(commits: &[EnhancedCommit<Note>]) -> HashMap<String, Bra
                     branch: push.branch.clone(),
                     target_branch,
                     origin: push.origin.clone(),
-                    commit_title: Some(commit.title.clone()),
+                    commit_title: commit.title.clone(),
+                    commit_description: commit.description.clone(),
                 };
 
                 states.insert(push.branch.clone(), state);
@@ -133,7 +155,8 @@ fn extract_branch_state_from_parsed(commits: &[ParsedCommit]) -> HashMap<String,
                 branch: target.branch.clone(),
                 target_branch,
                 origin: target.origin.clone(),
-                commit_title: Some(commit.title.clone()),
+                commit_title: commit.title.clone(),
+                commit_description: None,
             };
 
             states.insert(target.branch.clone(), state);
@@ -237,15 +260,9 @@ fn pr_exists(branch_name: &str) -> Result<bool, ()> {
 fn create_pull_request(branch_state: &BranchState, _main_branch_name: &str) -> Result<(), ()> {
     let target = &branch_state.target_branch;
 
-    // Use commit title as PR title, fallback to branch name
-    let pr_title = branch_state
-        .commit_title
-        .as_ref()
-        .unwrap_or(&branch_state.branch);
-
     println!(
         "📝 Creating PR: {} → {} (\"{}\")",
-        branch_state.branch, target, pr_title
+        branch_state.branch, target, branch_state.branch
     );
 
     let mut cmd = std::process::Command::new("gh");
@@ -257,11 +274,15 @@ fn create_pull_request(branch_state: &BranchState, _main_branch_name: &str) -> R
         "--base",
         target,
         "--title",
-        pr_title,
+        &branch_state.commit_title,
         "--body",
         &format!(
-            "Auto-created PR for branch `{}` targeting `{}`\n\n🤖 Created by yggit",
-            branch_state.branch, target
+            "{}`\n\n🤖 Created by yggit",
+            branch_state
+                .commit_description
+                .clone()
+                .unwrap_or_default()
+                .trim()
         ),
     ]);
 

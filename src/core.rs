@@ -4,14 +4,14 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Push {
     pub origin: Option<String>,
     pub branch: String,
     pub parent_branch: Option<String>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Note {
     pub push: Option<Push>,
 }
