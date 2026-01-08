@@ -11,27 +11,62 @@ pub struct Push {
     /// Skip GitHub PR creation and management
     #[arg(long)]
     pub no_pr: bool,
+
+    /// Skip pushing branches to remote
+    #[arg(long)]
+    pub no_push: bool,
 }
 
 const COMMENTS: &str = r#"
 # Here is how to use yggit
-# 
+#
 # Commands:
 # -> <branch>                    add a branch to the above commit
 # -> <origin>:<branch>           add a branch to the above commit with custom origin
 # -> <branch> => <parent_branch> add a branch that branches from <parent_branch>
-# 
+#
 # DAG Examples:
 # -> feature-1            (branches from previous commit or main if first)
 # -> feature-2 => main    (branches from main)
 # -> feature-3            (branches from feature-2, the previous branch)
-# 
+#
+# In-Band Commands (place at the top of the file):
+# ABORT                   abort the operation
+# NO_PR                   skip GitHub PR creation (same as --no-pr)
+# NO_PUSH                 skip pushing branches to remote (same as --no-push)
+#
 # What happens next?
 #  - All branches are pushed on origin, except if you specified a custom origin
 #  - Branches with => syntax create proper Git parent relationships (DAG structure)
 #
 # It's not a rebase, you can't edit commits nor reorder them
 "#;
+
+/// In-band commands parsed from the file content
+#[derive(Debug, Default)]
+struct InBandCommands {
+    abort: bool,
+    no_pr: bool,
+    no_push: bool,
+}
+
+/// Parse in-band commands from the content and return cleaned content
+fn parse_in_band_commands(content: &str) -> (String, InBandCommands) {
+    let mut commands = InBandCommands::default();
+    let mut cleaned_lines = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        match trimmed {
+            "ABORT" => commands.abort = true,
+            "NO_PR" => commands.no_pr = true,
+            "NO_PUSH" => commands.no_push = true,
+            _ => cleaned_lines.push(line),
+        }
+    }
+
+    (cleaned_lines.join("\n"), commands)
+}
 
 impl Push {
     pub fn execute(&self, git: Git) -> Result<(), ()> {
@@ -48,6 +83,19 @@ impl Push {
 
         let content = git.edit_file(file_path)?;
 
+        // Parse in-band commands from the content
+        let (cleaned_content, in_band_commands) = parse_in_band_commands(&content);
+
+        // Handle ABORT command
+        if in_band_commands.abort {
+            println!("🛑 ABORT command detected. Operation cancelled.");
+            return Err(());
+        }
+
+        // Override flags with in-band commands
+        let no_pr = self.no_pr || in_band_commands.no_pr;
+        let no_push = self.no_push || in_band_commands.no_push;
+
         // Get the actual main branch name (main or master)
         let main_branch_name = git
             .main_branch()
@@ -55,7 +103,7 @@ impl Push {
             .unwrap_or_else(|| "main".to_string());
 
         let after_commits = crate::parser::instruction_from_string_with_main_branch(
-            content,
+            cleaned_content,
             main_branch_name.clone(),
         )
         .ok_or_else(|| {
@@ -87,13 +135,18 @@ impl Push {
 
         save_note(&git, after_commits);
 
-        push_from_notes(&git);
+        // Step 2.5: Push branches (unless --no-push flag or NO_PUSH command is used)
+        if !no_push {
+            push_from_notes(&git);
+        } else {
+            println!("⏭️  Skipping push to remote (--no-push flag or NO_PUSH command used)");
+        }
 
-        // Step 3: Handle GitHub PR integration (unless --no-pr flag is used)
-        if !self.no_pr {
+        // Step 3: Handle GitHub PR integration (unless --no-pr flag or NO_PR command is used)
+        if !no_pr {
             handle_github_integration(&before_state, &after_state, &main_branch_name)?;
         } else {
-            println!("⏭️  Skipping GitHub PR integration (--no-pr flag used)");
+            println!("⏭️  Skipping GitHub PR integration (--no-pr flag or NO_PR command used)");
         }
 
         Ok(())
@@ -355,4 +408,80 @@ fn update_pull_request_base(branch_state: &BranchState, old_target: &str) -> Res
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_in_band_commands_abort() {
+        let content = "ABORT\n8c14734b80ff0ffb93caefc85553c7c5b05cca1e Some commit\n-> branch";
+        let (cleaned, commands) = parse_in_band_commands(content);
+        assert!(commands.abort);
+        assert!(!commands.no_pr);
+        assert!(!commands.no_push);
+        assert!(!cleaned.contains("ABORT"));
+        assert!(cleaned.contains("8c14734b80ff0ffb93caefc85553c7c5b05cca1e"));
+    }
+
+    #[test]
+    fn test_parse_in_band_commands_no_pr() {
+        let content = "NO_PR\n8c14734b80ff0ffb93caefc85553c7c5b05cca1e Some commit\n-> branch";
+        let (cleaned, commands) = parse_in_band_commands(content);
+        assert!(!commands.abort);
+        assert!(commands.no_pr);
+        assert!(!commands.no_push);
+        assert!(!cleaned.contains("NO_PR"));
+        assert!(cleaned.contains("8c14734b80ff0ffb93caefc85553c7c5b05cca1e"));
+    }
+
+    #[test]
+    fn test_parse_in_band_commands_no_push() {
+        let content = "NO_PUSH\n8c14734b80ff0ffb93caefc85553c7c5b05cca1e Some commit\n-> branch";
+        let (cleaned, commands) = parse_in_band_commands(content);
+        assert!(!commands.abort);
+        assert!(!commands.no_pr);
+        assert!(commands.no_push);
+        assert!(!cleaned.contains("NO_PUSH"));
+        assert!(cleaned.contains("8c14734b80ff0ffb93caefc85553c7c5b05cca1e"));
+    }
+
+    #[test]
+    fn test_parse_in_band_commands_multiple() {
+        let content = "NO_PR\nNO_PUSH\n8c14734b80ff0ffb93caefc85553c7c5b05cca1e Some commit\n-> branch";
+        let (cleaned, commands) = parse_in_band_commands(content);
+        assert!(!commands.abort);
+        assert!(commands.no_pr);
+        assert!(commands.no_push);
+        assert!(!cleaned.contains("NO_PR"));
+        assert!(!cleaned.contains("NO_PUSH"));
+        assert!(cleaned.contains("8c14734b80ff0ffb93caefc85553c7c5b05cca1e"));
+    }
+
+    #[test]
+    fn test_parse_in_band_commands_with_whitespace() {
+        let content = "  NO_PR  \n8c14734b80ff0ffb93caefc85553c7c5b05cca1e Some commit\n-> branch";
+        let (cleaned, commands) = parse_in_band_commands(content);
+        assert!(commands.no_pr);
+        assert!(!cleaned.contains("NO_PR"));
+    }
+
+    #[test]
+    fn test_parse_in_band_commands_none() {
+        let content = "8c14734b80ff0ffb93caefc85553c7c5b05cca1e Some commit\n-> branch";
+        let (cleaned, commands) = parse_in_band_commands(content);
+        assert!(!commands.abort);
+        assert!(!commands.no_pr);
+        assert!(!commands.no_push);
+        assert_eq!(cleaned, content);
+    }
+
+    #[test]
+    fn test_parse_in_band_commands_preserves_comments() {
+        let content = "NO_PR\n# This is a comment\n8c14734b80ff0ffb93caefc85553c7c5b05cca1e Some commit";
+        let (cleaned, commands) = parse_in_band_commands(content);
+        assert!(commands.no_pr);
+        assert!(cleaned.contains("# This is a comment"));
+    }
 }
