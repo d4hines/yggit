@@ -219,14 +219,22 @@ fn extract_branch_state_from_parsed(commits: &[ParsedCommit]) -> HashMap<String,
     states
 }
 
-/// Handle GitHub PR integration by comparing before/after states
+/// Handle GitHub PR integration by comparing desired state with actual GitHub state
 fn handle_github_integration(
-    before_state: &HashMap<String, BranchState>,
+    _before_state: &HashMap<String, BranchState>,
     after_state: &HashMap<String, BranchState>,
-    main_branch_name: &str,
+    _main_branch_name: &str,
+) -> Result<(), ()> {
+    handle_github_integration_with_ops(&RealGitHubOps, after_state)
+}
+
+/// Handle GitHub PR integration with injectable GitHub operations (for testing)
+fn handle_github_integration_with_ops(
+    gh_ops: &dyn GitHubOperations,
+    desired_state: &HashMap<String, BranchState>,
 ) -> Result<(), ()> {
     // Check if gh CLI is available
-    if !is_gh_available() {
+    if !gh_ops.is_available() {
         println!("📝 GitHub CLI (gh) not found. Skipping PR integration.");
         println!("   Install gh CLI for automatic PR management: https://cli.github.com/");
         return Ok(());
@@ -234,78 +242,116 @@ fn handle_github_integration(
 
     println!("🔗 Managing GitHub Pull Requests...");
 
-    // Handle new branches and target changes
-    for (branch_name, after_branch) in after_state {
-        if !before_state.contains_key(branch_name) {
-            // New branch - create PR
-            println!("🆕 New branch detected: {}", branch_name);
-            create_pull_request(after_branch, main_branch_name)?;
-        } else {
-            // Existing branch - check if target changed
-            let before_branch = &before_state[branch_name];
-            if before_branch.target_branch != after_branch.target_branch {
-                // Target changed - update PR
-                println!(
-                    "🔄 Target changed for {}: {} -> {}",
-                    branch_name, before_branch.target_branch, after_branch.target_branch
-                );
-                update_pull_request_base(after_branch, &before_branch.target_branch)?;
-            } else {
-                // Check if PR exists, create if missing
-                if !pr_exists(branch_name)? {
-                    println!("📝 No PR found for existing branch: {}", branch_name);
-                    create_pull_request(after_branch, main_branch_name)?;
+    // For each desired branch, compare with actual GitHub state
+    for (branch_name, desired_branch) in desired_state {
+        match gh_ops.get_pr_info(branch_name)? {
+            None => {
+                // No PR exists - create it
+                println!("📝 No PR found for '{}', creating...", branch_name);
+                gh_ops.create_pr(desired_branch)?;
+            }
+            Some(pr_info) => {
+                if pr_info.base_branch != desired_branch.target_branch {
+                    // PR exists but base branch is different - update it
+                    println!(
+                        "🔄 Updating PR base for '{}': {} → {}",
+                        branch_name, pr_info.base_branch, desired_branch.target_branch
+                    );
+                    gh_ops.update_pr_base(desired_branch, &pr_info.base_branch)?;
+                } else {
+                    // PR exists with correct base - nothing to do
+                    println!("✓ PR for '{}' already exists with correct base", branch_name);
                 }
             }
-        }
-    }
-
-    // Find removed branches (in before but not in after)
-    for (branch_name, _before_branch) in before_state {
-        if !after_state.contains_key(branch_name) {
-            println!("ℹ️  Branch '{}' removed. PR will remain open.", branch_name);
         }
     }
 
     Ok(())
 }
 
-/// Check if gh CLI is available
-fn is_gh_available() -> bool {
-    std::process::Command::new("gh")
-        .arg("--version")
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+/// Information about an existing PR
+#[derive(Debug, Clone, PartialEq)]
+struct PrInfo {
+    base_branch: String,
 }
 
-/// Check if a PR exists for the given branch
-fn pr_exists(branch_name: &str) -> Result<bool, ()> {
-    let mut cmd = std::process::Command::new("gh");
-    cmd.args(["pr", "list", "--head", branch_name, "--json", "number"]);
+/// Trait for GitHub operations, allowing for testing with mock implementations
+trait GitHubOperations {
+    fn is_available(&self) -> bool;
+    fn get_pr_info(&self, branch_name: &str) -> Result<Option<PrInfo>, ()>;
+    fn create_pr(&self, branch_state: &BranchState) -> Result<(), ()>;
+    fn update_pr_base(&self, branch_state: &BranchState, old_base: &str) -> Result<(), ()>;
+}
 
-    match cmd.output() {
-        Ok(output) => {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                // If the JSON output is "[]", no PRs exist for this branch
-                let exists = !stdout.trim().eq("[]");
-                println!("🔍 Debug - PR exists for {}: {}", branch_name, exists);
-                Ok(exists)
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                println!(
-                    "⚠️  Warning: Could not check PR status for {}: {}",
-                    branch_name, stderr
-                );
-                // If we can't check, assume it doesn't exist and try to create it
-                Ok(false)
+/// Real implementation using gh CLI
+struct RealGitHubOps;
+
+impl GitHubOperations for RealGitHubOps {
+    fn is_available(&self) -> bool {
+        std::process::Command::new("gh")
+            .arg("--version")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    fn get_pr_info(&self, branch_name: &str) -> Result<Option<PrInfo>, ()> {
+        let mut cmd = std::process::Command::new("gh");
+        cmd.args([
+            "pr",
+            "list",
+            "--head",
+            branch_name,
+            "--json",
+            "baseRefName",
+            "--limit",
+            "1",
+        ]);
+
+        match cmd.output() {
+            Ok(output) => {
+                if output.status.success() {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    // Parse JSON: [{"baseRefName": "main"}] or []
+                    if stdout.trim() == "[]" {
+                        Ok(None)
+                    } else {
+                        // Simple JSON parsing for baseRefName
+                        if let Some(base_start) = stdout.find("\"baseRefName\":") {
+                            if let Some(value_start) = stdout[base_start..].find('"') {
+                                let value_offset = base_start + value_start + 1;
+                                if let Some(value_end) = stdout[value_offset..].find('"') {
+                                    let base_branch =
+                                        stdout[value_offset..value_offset + value_end].to_string();
+                                    return Ok(Some(PrInfo { base_branch }));
+                                }
+                            }
+                        }
+                        println!("⚠️  Warning: Could not parse PR info for {}", branch_name);
+                        Ok(None)
+                    }
+                } else {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    println!(
+                        "⚠️  Warning: Could not get PR info for {}: {}",
+                        branch_name, stderr
+                    );
+                    Ok(None)
+                }
+            }
+            Err(e) => {
+                println!("❌ Error getting PR info: {}", e);
+                Err(())
             }
         }
-        Err(e) => {
-            println!("❌ Error checking PR status: {}", e);
-            Err(())
-        }
+    }
+
+    fn create_pr(&self, branch_state: &BranchState) -> Result<(), ()> {
+        create_pull_request(branch_state, &branch_state.target_branch)
+    }
+
+    fn update_pr_base(&self, branch_state: &BranchState, old_base: &str) -> Result<(), ()> {
+        update_pull_request_base(branch_state, old_base)
     }
 }
 
@@ -413,6 +459,196 @@ fn update_pull_request_base(branch_state: &BranchState, old_target: &str) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::RefCell;
+
+    /// Mock GitHub operations for testing
+    struct MockGitHubOps {
+        available: bool,
+        pr_state: RefCell<HashMap<String, Option<PrInfo>>>,
+        created_prs: RefCell<Vec<String>>,
+        updated_prs: RefCell<Vec<(String, String, String)>>, // (branch, old_base, new_base)
+    }
+
+    impl MockGitHubOps {
+        fn new(available: bool) -> Self {
+            Self {
+                available,
+                pr_state: RefCell::new(HashMap::new()),
+                created_prs: RefCell::new(Vec::new()),
+                updated_prs: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn with_pr(self, branch: &str, base: &str) -> Self {
+            self.pr_state.borrow_mut().insert(
+                branch.to_string(),
+                Some(PrInfo {
+                    base_branch: base.to_string(),
+                }),
+            );
+            self
+        }
+
+        fn with_no_pr(self, branch: &str) -> Self {
+            self.pr_state
+                .borrow_mut()
+                .insert(branch.to_string(), None);
+            self
+        }
+    }
+
+    impl GitHubOperations for MockGitHubOps {
+        fn is_available(&self) -> bool {
+            self.available
+        }
+
+        fn get_pr_info(&self, branch_name: &str) -> Result<Option<PrInfo>, ()> {
+            Ok(self
+                .pr_state
+                .borrow()
+                .get(branch_name)
+                .cloned()
+                .unwrap_or(None))
+        }
+
+        fn create_pr(&self, branch_state: &BranchState) -> Result<(), ()> {
+            self.created_prs
+                .borrow_mut()
+                .push(branch_state.branch.clone());
+            Ok(())
+        }
+
+        fn update_pr_base(&self, branch_state: &BranchState, old_base: &str) -> Result<(), ()> {
+            self.updated_prs.borrow_mut().push((
+                branch_state.branch.clone(),
+                old_base.to_string(),
+                branch_state.target_branch.clone(),
+            ));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_github_integration_no_pr_exists_creates_pr() {
+        let mock = MockGitHubOps::new(true).with_no_pr("feature-1");
+
+        let mut desired_state = HashMap::new();
+        desired_state.insert(
+            "feature-1".to_string(),
+            BranchState {
+                branch: "feature-1".to_string(),
+                target_branch: "main".to_string(),
+                origin: None,
+                commit_title: "Add feature 1".to_string(),
+                commit_description: None,
+            },
+        );
+
+        let result = handle_github_integration_with_ops(&mock, &desired_state);
+        assert!(result.is_ok());
+        assert_eq!(mock.created_prs.borrow().len(), 1);
+        assert_eq!(mock.created_prs.borrow()[0], "feature-1");
+        assert_eq!(mock.updated_prs.borrow().len(), 0);
+    }
+
+    #[test]
+    fn test_github_integration_pr_exists_same_base_no_action() {
+        let mock = MockGitHubOps::new(true).with_pr("feature-1", "main");
+
+        let mut desired_state = HashMap::new();
+        desired_state.insert(
+            "feature-1".to_string(),
+            BranchState {
+                branch: "feature-1".to_string(),
+                target_branch: "main".to_string(),
+                origin: None,
+                commit_title: "Add feature 1".to_string(),
+                commit_description: None,
+            },
+        );
+
+        let result = handle_github_integration_with_ops(&mock, &desired_state);
+        assert!(result.is_ok());
+        assert_eq!(mock.created_prs.borrow().len(), 0);
+        assert_eq!(mock.updated_prs.borrow().len(), 0);
+    }
+
+    #[test]
+    fn test_github_integration_pr_exists_different_base_updates() {
+        let mock = MockGitHubOps::new(true).with_pr("feature-1", "develop");
+
+        let mut desired_state = HashMap::new();
+        desired_state.insert(
+            "feature-1".to_string(),
+            BranchState {
+                branch: "feature-1".to_string(),
+                target_branch: "main".to_string(),
+                origin: None,
+                commit_title: "Add feature 1".to_string(),
+                commit_description: None,
+            },
+        );
+
+        let result = handle_github_integration_with_ops(&mock, &desired_state);
+        assert!(result.is_ok());
+        assert_eq!(mock.created_prs.borrow().len(), 0);
+        assert_eq!(mock.updated_prs.borrow().len(), 1);
+        assert_eq!(
+            mock.updated_prs.borrow()[0],
+            ("feature-1".to_string(), "develop".to_string(), "main".to_string())
+        );
+    }
+
+    #[test]
+    fn test_github_integration_lost_notes_scenario() {
+        // Simulates the scenario where git notes were lost:
+        // - PRs exist on GitHub for feature-1 (base: main) and feature-2 (base: feature-1)
+        // - User re-adds annotations
+        // - Should detect existing PRs and not try to recreate them
+        let mock = MockGitHubOps::new(true)
+            .with_pr("feature-1", "main")
+            .with_pr("feature-2", "feature-1");
+
+        let mut desired_state = HashMap::new();
+        desired_state.insert(
+            "feature-1".to_string(),
+            BranchState {
+                branch: "feature-1".to_string(),
+                target_branch: "main".to_string(),
+                origin: None,
+                commit_title: "Add feature 1".to_string(),
+                commit_description: None,
+            },
+        );
+        desired_state.insert(
+            "feature-2".to_string(),
+            BranchState {
+                branch: "feature-2".to_string(),
+                target_branch: "feature-1".to_string(),
+                origin: None,
+                commit_title: "Add feature 2".to_string(),
+                commit_description: None,
+            },
+        );
+
+        let result = handle_github_integration_with_ops(&mock, &desired_state);
+        assert!(result.is_ok());
+        // Should not create any PRs since they already exist with correct bases
+        assert_eq!(mock.created_prs.borrow().len(), 0);
+        assert_eq!(mock.updated_prs.borrow().len(), 0);
+    }
+
+    #[test]
+    fn test_github_integration_gh_not_available() {
+        let mock = MockGitHubOps::new(false);
+        let desired_state = HashMap::new();
+
+        let result = handle_github_integration_with_ops(&mock, &desired_state);
+        assert!(result.is_ok());
+        // Should exit early without any operations
+        assert_eq!(mock.created_prs.borrow().len(), 0);
+        assert_eq!(mock.updated_prs.borrow().len(), 0);
+    }
 
     #[test]
     fn test_parse_in_band_commands_abort() {
